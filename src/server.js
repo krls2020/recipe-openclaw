@@ -1,0 +1,875 @@
+import childProcess from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+
+import express from "express";
+import httpProxy from "http-proxy";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+const PORT = 8080;
+const STATE_DIR =
+  process.env.OPENCLAW_STATE_DIR?.trim() || "/mnt/storage/.openclaw";
+const WORKSPACE_DIR =
+  process.env.OPENCLAW_WORKSPACE_DIR?.trim() || "/mnt/storage/workspace";
+
+const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
+
+const INTERNAL_GATEWAY_PORT = Number.parseInt(
+  process.env.INTERNAL_GATEWAY_PORT ?? "18789",
+  10,
+);
+const INTERNAL_GATEWAY_HOST = process.env.INTERNAL_GATEWAY_HOST ?? "127.0.0.1";
+const GATEWAY_TARGET = `http://${INTERNAL_GATEWAY_HOST}:${INTERNAL_GATEWAY_PORT}`;
+
+// Use the openclaw binary installed via npm
+const OPENCLAW_BIN = path.join(process.cwd(), "node_modules", ".bin", "openclaw");
+const OPENCLAW_NODE = process.env.OPENCLAW_NODE?.trim() || "node";
+const OPENCLAW_ENTRY = path.join(
+  process.cwd(),
+  "node_modules",
+  "openclaw",
+  "dist",
+  "entry.js",
+);
+
+// ---------------------------------------------------------------------------
+// Gateway token
+// ---------------------------------------------------------------------------
+
+function resolveGatewayToken() {
+  const envTok = process.env.OPENCLAW_GATEWAY_TOKEN?.trim();
+  if (envTok) return envTok;
+
+  const tokenPath = path.join(STATE_DIR, "gateway.token");
+  try {
+    const existing = fs.readFileSync(tokenPath, "utf8").trim();
+    if (existing) return existing;
+  } catch (err) {
+    console.warn(
+      `[gateway-token] could not read existing token: ${err.code || err.message}`,
+    );
+  }
+
+  const generated = crypto.randomBytes(32).toString("hex");
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(tokenPath, generated, { encoding: "utf8", mode: 0o600 });
+  } catch (err) {
+    console.warn(
+      `[gateway-token] could not persist token: ${err.code || err.message}`,
+    );
+  }
+  return generated;
+}
+
+const OPENCLAW_GATEWAY_TOKEN = resolveGatewayToken();
+process.env.OPENCLAW_GATEWAY_TOKEN = OPENCLAW_GATEWAY_TOKEN;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function clawArgs(args) {
+  return [OPENCLAW_ENTRY, ...args];
+}
+
+function configPath() {
+  return (
+    process.env.OPENCLAW_CONFIG_PATH?.trim() ||
+    path.join(STATE_DIR, "openclaw.json")
+  );
+}
+
+function isConfigured() {
+  try {
+    return fs.existsSync(configPath());
+  } catch {
+    return false;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function runCmd(cmd, args, opts = {}) {
+  return new Promise((resolve) => {
+    const proc = childProcess.spawn(cmd, args, {
+      ...opts,
+      env: {
+        ...process.env,
+        OPENCLAW_STATE_DIR: STATE_DIR,
+        OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+      },
+    });
+
+    let out = "";
+    proc.stdout?.on("data", (d) => (out += d.toString("utf8")));
+    proc.stderr?.on("data", (d) => (out += d.toString("utf8")));
+
+    proc.on("error", (err) => {
+      out += `\n[spawn error] ${String(err)}\n`;
+      resolve({ code: 127, output: out });
+    });
+
+    proc.on("close", (code) => resolve({ code: code ?? 0, output: out }));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// OpenClaw info cache
+// ---------------------------------------------------------------------------
+
+let cachedOpenclawVersion = null;
+let cachedChannelsHelp = null;
+
+async function getOpenclawInfo() {
+  if (!cachedOpenclawVersion) {
+    const [version, channelsHelp] = await Promise.all([
+      runCmd(OPENCLAW_NODE, clawArgs(["--version"])),
+      runCmd(OPENCLAW_NODE, clawArgs(["channels", "add", "--help"])),
+    ]);
+    cachedOpenclawVersion = version.output.trim();
+    cachedChannelsHelp = channelsHelp.output;
+  }
+  return { version: cachedOpenclawVersion, channelsHelp: cachedChannelsHelp };
+}
+
+// ---------------------------------------------------------------------------
+// Gateway lifecycle
+// ---------------------------------------------------------------------------
+
+let gatewayProc = null;
+let gatewayStarting = null;
+
+async function waitForGatewayReady(opts = {}) {
+  const timeoutMs = opts.timeoutMs ?? 60_000;
+  const start = Date.now();
+  const endpoints = ["/openclaw", "/", "/health"];
+
+  while (Date.now() - start < timeoutMs) {
+    for (const endpoint of endpoints) {
+      try {
+        const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, {
+          method: "GET",
+        });
+        if (res) {
+          console.log(`[gateway] ready at ${endpoint}`);
+          return true;
+        }
+      } catch (err) {
+        if (err.code !== "ECONNREFUSED" && err.cause?.code !== "ECONNREFUSED") {
+          const msg = err.code || err.message;
+          if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
+            console.warn(`[gateway] health check error: ${msg}`);
+          }
+        }
+      }
+    }
+    await sleep(250);
+  }
+  console.error(
+    `[gateway] failed to become ready after ${timeoutMs / 1000} seconds`,
+  );
+  return false;
+}
+
+async function startGateway() {
+  if (gatewayProc) return;
+  if (!isConfigured()) throw new Error("Gateway cannot start: not configured");
+
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+
+  const args = [
+    "gateway",
+    "run",
+    "--bind",
+    "loopback",
+    "--port",
+    String(INTERNAL_GATEWAY_PORT),
+    "--auth",
+    "token",
+    "--token",
+    OPENCLAW_GATEWAY_TOKEN,
+  ];
+
+  gatewayProc = childProcess.spawn(OPENCLAW_NODE, clawArgs(args), {
+    stdio: "inherit",
+    env: {
+      ...process.env,
+      OPENCLAW_STATE_DIR: STATE_DIR,
+      OPENCLAW_WORKSPACE_DIR: WORKSPACE_DIR,
+    },
+  });
+
+  const safeArgs = args.map((arg, i) =>
+    args[i - 1] === "--token" ? "[REDACTED]" : arg,
+  );
+  console.log(
+    `[gateway] starting: ${OPENCLAW_NODE} ${clawArgs(safeArgs).join(" ")}`,
+  );
+  console.log(`[gateway] STATE_DIR: ${STATE_DIR}`);
+  console.log(`[gateway] WORKSPACE_DIR: ${WORKSPACE_DIR}`);
+  console.log(`[gateway] config: ${configPath()}`);
+
+  gatewayProc.on("error", (err) => {
+    console.error(`[gateway] spawn error: ${String(err)}`);
+    gatewayProc = null;
+  });
+
+  gatewayProc.on("exit", (code, signal) => {
+    console.error(`[gateway] exited code=${code} signal=${signal}`);
+    gatewayProc = null;
+  });
+}
+
+async function ensureGatewayRunning() {
+  if (!isConfigured()) return { ok: false, reason: "not configured" };
+  if (gatewayProc) return { ok: true };
+  if (!gatewayStarting) {
+    gatewayStarting = (async () => {
+      await startGateway();
+      const ready = await waitForGatewayReady({ timeoutMs: 60_000 });
+      if (!ready) {
+        throw new Error("Gateway did not become ready in time");
+      }
+    })().finally(() => {
+      gatewayStarting = null;
+    });
+  }
+  await gatewayStarting;
+  return { ok: true };
+}
+
+function isGatewayStarting() {
+  return gatewayStarting !== null;
+}
+
+function isGatewayReady() {
+  return gatewayProc !== null && gatewayStarting === null;
+}
+
+async function restartGateway() {
+  if (gatewayProc) {
+    try {
+      gatewayProc.kill("SIGTERM");
+    } catch (err) {
+      console.warn(`[gateway] kill error: ${err.message}`);
+    }
+    await sleep(750);
+    gatewayProc = null;
+  }
+  return ensureGatewayRunning();
+}
+
+// ---------------------------------------------------------------------------
+// Setup auth (Basic auth + rate limiter)
+// ---------------------------------------------------------------------------
+
+const setupRateLimiter = {
+  attempts: new Map(),
+  windowMs: 60_000,
+  maxAttempts: 50,
+  cleanupInterval: setInterval(function () {
+    const now = Date.now();
+    for (const [ip, data] of setupRateLimiter.attempts) {
+      if (now - data.windowStart > setupRateLimiter.windowMs) {
+        setupRateLimiter.attempts.delete(ip);
+      }
+    }
+  }, 60_000),
+
+  isRateLimited(ip) {
+    const now = Date.now();
+    const data = this.attempts.get(ip);
+    if (!data || now - data.windowStart > this.windowMs) {
+      this.attempts.set(ip, { windowStart: now, count: 1 });
+      return false;
+    }
+    data.count++;
+    return data.count > this.maxAttempts;
+  },
+};
+
+function requireSetupAuth(req, res, next) {
+  if (!SETUP_PASSWORD) {
+    return res
+      .status(500)
+      .type("text/plain")
+      .send(
+        "SETUP_PASSWORD is not set. Set it in Zerops service environment variables.",
+      );
+  }
+
+  const ip = req.ip || req.socket?.remoteAddress || "unknown";
+  if (setupRateLimiter.isRateLimited(ip)) {
+    return res
+      .status(429)
+      .type("text/plain")
+      .send("Too many requests. Try again later.");
+  }
+
+  const header = req.headers.authorization || "";
+  const [scheme, encoded] = header.split(" ");
+  if (scheme !== "Basic" || !encoded) {
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
+    return res.status(401).send("Auth required");
+  }
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
+  const idx = decoded.indexOf(":");
+  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+  const passwordHash = crypto.createHash("sha256").update(password).digest();
+  const expectedHash = crypto
+    .createHash("sha256")
+    .update(SETUP_PASSWORD)
+    .digest();
+  const isValid = crypto.timingSafeEqual(passwordHash, expectedHash);
+  if (!isValid) {
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
+    return res.status(401).send("Invalid password");
+  }
+  return next();
+}
+
+// ---------------------------------------------------------------------------
+// Onboard helpers
+// ---------------------------------------------------------------------------
+
+const VALID_FLOWS = ["quickstart", "advanced", "manual"];
+const VALID_AUTH_CHOICES = [
+  "codex-cli",
+  "openai-codex",
+  "openai-api-key",
+  "claude-cli",
+  "token",
+  "apiKey",
+  "gemini-api-key",
+  "google-antigravity",
+  "google-gemini-cli",
+  "openrouter-api-key",
+  "ai-gateway-api-key",
+  "moonshot-api-key",
+  "kimi-code-api-key",
+  "zai-api-key",
+  "minimax-api",
+  "minimax-api-lightning",
+  "qwen-portal",
+  "github-copilot",
+  "copilot-proxy",
+  "synthetic-api-key",
+  "opencode-zen",
+];
+
+function validatePayload(payload) {
+  if (payload.flow && !VALID_FLOWS.includes(payload.flow)) {
+    return `Invalid flow: ${payload.flow}. Must be one of: ${VALID_FLOWS.join(", ")}`;
+  }
+  if (payload.authChoice && !VALID_AUTH_CHOICES.includes(payload.authChoice)) {
+    return `Invalid authChoice: ${payload.authChoice}`;
+  }
+  const stringFields = [
+    "telegramToken",
+    "discordToken",
+    "slackBotToken",
+    "slackAppToken",
+    "authSecret",
+    "model",
+  ];
+  for (const field of stringFields) {
+    if (payload[field] !== undefined && typeof payload[field] !== "string") {
+      return `Invalid ${field}: must be a string`;
+    }
+  }
+  return null;
+}
+
+function buildOnboardArgs(payload) {
+  const args = [
+    "onboard",
+    "--non-interactive",
+    "--accept-risk",
+    "--json",
+    "--no-install-daemon",
+    "--skip-health",
+    "--workspace",
+    WORKSPACE_DIR,
+    "--gateway-bind",
+    "loopback",
+    "--gateway-port",
+    String(INTERNAL_GATEWAY_PORT),
+    "--gateway-auth",
+    "token",
+    "--gateway-token",
+    OPENCLAW_GATEWAY_TOKEN,
+    "--flow",
+    payload.flow || "quickstart",
+  ];
+
+  if (payload.authChoice) {
+    args.push("--auth-choice", payload.authChoice);
+
+    const secret = (payload.authSecret || "").trim();
+    const map = {
+      "openai-api-key": "--openai-api-key",
+      apiKey: "--anthropic-api-key",
+      "openrouter-api-key": "--openrouter-api-key",
+      "ai-gateway-api-key": "--ai-gateway-api-key",
+      "moonshot-api-key": "--moonshot-api-key",
+      "kimi-code-api-key": "--kimi-code-api-key",
+      "gemini-api-key": "--gemini-api-key",
+      "zai-api-key": "--zai-api-key",
+      "minimax-api": "--minimax-api-key",
+      "minimax-api-lightning": "--minimax-api-key",
+      "synthetic-api-key": "--synthetic-api-key",
+      "opencode-zen": "--opencode-zen-api-key",
+    };
+    const flag = map[payload.authChoice];
+    if (flag && secret) {
+      args.push(flag, secret);
+    }
+
+    if (payload.authChoice === "token" && secret) {
+      args.push("--token-provider", "anthropic", "--token", secret);
+    }
+  }
+
+  return args;
+}
+
+// ---------------------------------------------------------------------------
+// Auth groups for setup UI
+// ---------------------------------------------------------------------------
+
+const AUTH_GROUPS = [
+  {
+    value: "openai",
+    label: "OpenAI",
+    hint: "Codex OAuth + API key",
+    options: [
+      { value: "codex-cli", label: "OpenAI Codex OAuth (Codex CLI)" },
+      { value: "openai-codex", label: "OpenAI Codex (ChatGPT OAuth)" },
+      { value: "openai-api-key", label: "OpenAI API key" },
+    ],
+  },
+  {
+    value: "anthropic",
+    label: "Anthropic",
+    hint: "Claude Code CLI + API key",
+    options: [
+      { value: "claude-cli", label: "Anthropic token (Claude Code CLI)" },
+      { value: "token", label: "Anthropic token (paste setup-token)" },
+      { value: "apiKey", label: "Anthropic API key" },
+    ],
+  },
+  {
+    value: "google",
+    label: "Google",
+    hint: "Gemini API key + OAuth",
+    options: [
+      { value: "gemini-api-key", label: "Google Gemini API key" },
+      { value: "google-antigravity", label: "Google Antigravity OAuth" },
+      { value: "google-gemini-cli", label: "Google Gemini CLI OAuth" },
+    ],
+  },
+  {
+    value: "openrouter",
+    label: "OpenRouter",
+    hint: "API key",
+    options: [{ value: "openrouter-api-key", label: "OpenRouter API key" }],
+  },
+  {
+    value: "ai-gateway",
+    label: "Vercel AI Gateway",
+    hint: "API key",
+    options: [
+      { value: "ai-gateway-api-key", label: "Vercel AI Gateway API key" },
+    ],
+  },
+  {
+    value: "moonshot",
+    label: "Moonshot AI",
+    hint: "Kimi K2 + Kimi Code",
+    options: [
+      { value: "moonshot-api-key", label: "Moonshot AI API key" },
+      { value: "kimi-code-api-key", label: "Kimi Code API key" },
+    ],
+  },
+  {
+    value: "zai",
+    label: "Z.AI (GLM 4.7)",
+    hint: "API key",
+    options: [{ value: "zai-api-key", label: "Z.AI (GLM 4.7) API key" }],
+  },
+  {
+    value: "minimax",
+    label: "MiniMax",
+    hint: "M2.1 (recommended)",
+    options: [
+      { value: "minimax-api", label: "MiniMax M2.1" },
+      { value: "minimax-api-lightning", label: "MiniMax M2.1 Lightning" },
+    ],
+  },
+  {
+    value: "qwen",
+    label: "Qwen",
+    hint: "OAuth",
+    options: [{ value: "qwen-portal", label: "Qwen OAuth" }],
+  },
+  {
+    value: "copilot",
+    label: "Copilot",
+    hint: "GitHub + local proxy",
+    options: [
+      {
+        value: "github-copilot",
+        label: "GitHub Copilot (GitHub device login)",
+      },
+      { value: "copilot-proxy", label: "Copilot Proxy (local)" },
+    ],
+  },
+  {
+    value: "synthetic",
+    label: "Synthetic",
+    hint: "Anthropic-compatible (multi-model)",
+    options: [{ value: "synthetic-api-key", label: "Synthetic API key" }],
+  },
+  {
+    value: "opencode-zen",
+    label: "OpenCode Zen",
+    hint: "API key",
+    options: [
+      { value: "opencode-zen", label: "OpenCode Zen (multi-model proxy)" },
+    ],
+  },
+];
+
+// ---------------------------------------------------------------------------
+// Express app
+// ---------------------------------------------------------------------------
+
+const app = express();
+app.disable("x-powered-by");
+app.use(express.json({ limit: "1mb" }));
+
+// Health check — always available (used by readinessCheck + healthCheck)
+app.get("/setup/healthz", (_req, res) => res.json({ ok: true }));
+
+// Static assets for setup UI
+app.get("/setup/styles.css", (_req, res) => {
+  res.type("text/css");
+  res.sendFile(path.join(process.cwd(), "src", "public", "styles.css"));
+});
+
+// Setup wizard page
+app.get("/setup", requireSetupAuth, (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "setup.html"));
+});
+
+// Setup API: status
+app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
+  const { version, channelsHelp } = await getOpenclawInfo();
+  res.json({
+    configured: isConfigured(),
+    gatewayTarget: GATEWAY_TARGET,
+    openclawVersion: version,
+    channelsAddHelp: channelsHelp,
+    authGroups: AUTH_GROUPS,
+  });
+});
+
+// Setup API: run onboarding
+app.post("/setup/api/run", requireSetupAuth, async (req, res) => {
+  try {
+    if (isConfigured()) {
+      await ensureGatewayRunning();
+      return res.json({
+        ok: true,
+        output:
+          "Already configured.\nUse Reset setup if you want to rerun onboarding.\n",
+      });
+    }
+
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+
+    const payload = req.body || {};
+    const validationError = validatePayload(payload);
+    if (validationError) {
+      return res.status(400).json({ ok: false, output: validationError });
+    }
+
+    const onboardArgs = buildOnboardArgs(payload);
+    const onboard = await runCmd(OPENCLAW_NODE, clawArgs(onboardArgs));
+
+    let extra = "";
+    extra += `\n[setup] Onboarding exit=${onboard.code} configured=${isConfigured()}\n`;
+
+    const ok = onboard.code === 0 && isConfigured();
+
+    if (ok) {
+      extra += "\n[setup] Configuring gateway settings...\n";
+
+      // Set trustedProxies to loopback (wrapper handles external proxy trust)
+      const proxiesResult = await runCmd(
+        OPENCLAW_NODE,
+        clawArgs([
+          "config",
+          "set",
+          "--json",
+          "gateway.trustedProxies",
+          '["127.0.0.1"]',
+        ]),
+      );
+      extra += `[config] gateway.trustedProxies exit=${proxiesResult.code}\n`;
+
+      // Allow token-only auth for Control UI
+      const allowInsecureResult = await runCmd(
+        OPENCLAW_NODE,
+        clawArgs([
+          "config",
+          "set",
+          "gateway.controlUi.allowInsecureAuth",
+          "true",
+        ]),
+      );
+      extra += `[config] allowInsecureAuth exit=${allowInsecureResult.code}\n`;
+
+      // Persist gateway auth token in config
+      const tokenResult = await runCmd(
+        OPENCLAW_NODE,
+        clawArgs([
+          "config",
+          "set",
+          "gateway.auth.token",
+          OPENCLAW_GATEWAY_TOKEN,
+        ]),
+      );
+      extra += `[config] gateway.auth.token exit=${tokenResult.code}\n`;
+
+      // Optional: set model
+      if (payload.model?.trim()) {
+        extra += `[setup] Setting model to ${payload.model.trim()}...\n`;
+        const modelResult = await runCmd(
+          OPENCLAW_NODE,
+          clawArgs(["models", "set", payload.model.trim()]),
+        );
+        extra += `[models set] exit=${modelResult.code}\n${modelResult.output || ""}`;
+      }
+
+      // Optional: configure channels
+      const channelsHelp = await runCmd(
+        OPENCLAW_NODE,
+        clawArgs(["channels", "add", "--help"]),
+      );
+      const helpText = channelsHelp.output || "";
+
+      async function configureChannel(name, cfgObj) {
+        if (!helpText.includes(name)) {
+          return `\n[${name}] skipped (not supported in this openclaw build)\n`;
+        }
+        const set = await runCmd(
+          OPENCLAW_NODE,
+          clawArgs([
+            "config",
+            "set",
+            "--json",
+            `channels.${name}`,
+            JSON.stringify(cfgObj),
+          ]),
+        );
+        return `\n[${name} config] exit=${set.code}\n${set.output || "(no output)"}`;
+      }
+
+      if (payload.telegramToken?.trim()) {
+        extra += await configureChannel("telegram", {
+          enabled: true,
+          dmPolicy: "pairing",
+          botToken: payload.telegramToken.trim(),
+          groupPolicy: "allowlist",
+          streamMode: "partial",
+        });
+      }
+
+      if (payload.discordToken?.trim()) {
+        extra += await configureChannel("discord", {
+          enabled: true,
+          token: payload.discordToken.trim(),
+          groupPolicy: "allowlist",
+          dm: { policy: "pairing" },
+        });
+      }
+
+      if (payload.slackBotToken?.trim() || payload.slackAppToken?.trim()) {
+        extra += await configureChannel("slack", {
+          enabled: true,
+          botToken: payload.slackBotToken?.trim() || undefined,
+          appToken: payload.slackAppToken?.trim() || undefined,
+        });
+      }
+
+      extra += "\n[setup] Starting gateway...\n";
+      await restartGateway();
+      extra += "[setup] Gateway started.\n";
+    }
+
+    return res.status(ok ? 200 : 500).json({
+      ok,
+      output: `${onboard.output}${extra}`,
+    });
+  } catch (err) {
+    console.error("[/setup/api/run] error:", err);
+    return res
+      .status(500)
+      .json({ ok: false, output: `Internal error: ${String(err)}` });
+  }
+});
+
+// Setup API: approve pairing
+app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
+  const { channel, code } = req.body || {};
+  if (!channel || !code) {
+    return res
+      .status(400)
+      .json({ ok: false, error: "Missing channel or code" });
+  }
+  const r = await runCmd(
+    OPENCLAW_NODE,
+    clawArgs(["pairing", "approve", String(channel), String(code)]),
+  );
+  return res
+    .status(r.code === 0 ? 200 : 500)
+    .json({ ok: r.code === 0, output: r.output });
+});
+
+// Setup API: reset config
+app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
+  try {
+    fs.rmSync(configPath(), { force: true });
+    res
+      .type("text/plain")
+      .send("OK - deleted config file. You can rerun setup now.");
+  } catch (err) {
+    res.status(500).type("text/plain").send(String(err));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Proxy to gateway
+// ---------------------------------------------------------------------------
+
+const proxy = httpProxy.createProxyServer({
+  target: GATEWAY_TARGET,
+  ws: true,
+  xfwd: true,
+});
+
+proxy.on("error", (err, _req, _res) => {
+  console.error("[proxy]", err);
+});
+
+proxy.on("proxyReq", (proxyReq) => {
+  proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+});
+
+proxy.on("proxyReqWs", (proxyReq) => {
+  proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+});
+
+// Catch-all: redirect to /setup if not configured, otherwise proxy
+app.use(async (req, res) => {
+  if (!isConfigured() && !req.path.startsWith("/setup")) {
+    return res.redirect("/setup");
+  }
+
+  if (isConfigured()) {
+    try {
+      await ensureGatewayRunning();
+    } catch (err) {
+      return res
+        .status(503)
+        .type("text/plain")
+        .send(`Gateway not ready: ${String(err)}`);
+    }
+  }
+
+  // Auto-inject token for Control UI (prevent token leak via Referer header)
+  if (req.path === "/openclaw" && !req.query.token) {
+    res.set("Referrer-Policy", "no-referrer");
+    return res.redirect(`/openclaw?token=${OPENCLAW_GATEWAY_TOKEN}`);
+  }
+
+  return proxy.web(req, res, { target: GATEWAY_TARGET });
+});
+
+// ---------------------------------------------------------------------------
+// Start server
+// ---------------------------------------------------------------------------
+
+const server = app.listen(PORT, () => {
+  console.log(`[wrapper] listening on port ${PORT}`);
+  console.log(`[wrapper] setup wizard: http://localhost:${PORT}/setup`);
+  console.log(`[wrapper] configured: ${isConfigured()}`);
+
+  if (isConfigured()) {
+    ensureGatewayRunning().catch((err) => {
+      console.error(
+        `[wrapper] failed to start gateway at boot: ${err.message}`,
+      );
+    });
+  }
+});
+
+// WebSocket upgrade
+server.on("upgrade", async (req, socket, head) => {
+  if (!isConfigured()) {
+    socket.destroy();
+    return;
+  }
+  try {
+    await ensureGatewayRunning();
+  } catch (err) {
+    console.warn(`[websocket] gateway not ready: ${err.message}`);
+    socket.destroy();
+    return;
+  }
+  proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
+});
+
+// ---------------------------------------------------------------------------
+// Graceful shutdown
+// ---------------------------------------------------------------------------
+
+async function gracefulShutdown(signal) {
+  console.log(`[wrapper] received ${signal}, shutting down`);
+
+  if (setupRateLimiter.cleanupInterval) {
+    clearInterval(setupRateLimiter.cleanupInterval);
+  }
+
+  server.close();
+
+  if (gatewayProc) {
+    try {
+      gatewayProc.kill("SIGTERM");
+      await Promise.race([
+        new Promise((resolve) => gatewayProc.on("exit", resolve)),
+        new Promise((resolve) => setTimeout(resolve, 2000)),
+      ]);
+      if (gatewayProc && !gatewayProc.killed) {
+        gatewayProc.kill("SIGKILL");
+      }
+    } catch (err) {
+      console.warn(`[wrapper] error killing gateway: ${err.message}`);
+    }
+  }
+
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+process.on("SIGINT", () => gracefulShutdown("SIGINT"));

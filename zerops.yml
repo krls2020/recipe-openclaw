@@ -1,0 +1,47 @@
+zerops:
+  - setup: openclaw
+    build:
+      base: nodejs@22
+      os: ubuntu
+
+      buildCommands:
+        - npm install
+        - npm install --force @mariozechner/clipboard-linux-x64-musl
+
+      deployFiles:
+        - node_modules
+        - src
+        - package.json
+        - package-lock.json
+
+      cache:
+        - node_modules
+
+    deploy:
+      readinessCheck:
+        httpGet:
+          port: 8080
+          path: /setup/healthz
+
+    run:
+      os: ubuntu
+
+      initCommands:
+        - mkdir -p /mnt/storage/.openclaw /mnt/storage/workspace
+
+      envVariables:
+        NODE_ENV: production
+        NODE_OPTIONS: "--max-old-space-size=1536 --no-deprecation"
+        OPENCLAW_STATE_DIR: /mnt/storage/.openclaw
+        OPENCLAW_WORKSPACE_DIR: /mnt/storage/workspace
+
+      start: node src/server.js
+
+      ports:
+        - port: 8080
+          httpSupport: true
+
+      healthCheck:
+        httpGet:
+          port: 8080
+          path: /setup/healthz

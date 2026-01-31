@@ -1,0 +1,24 @@
+#yamlPreprocessor=on
+services:
+  # Persistent storage for OpenClaw state + workspace
+  - hostname: storage
+    type: shared-storage
+    mode: NON_HA
+    priority: 10
+
+  # OpenClaw Gateway + Web UI
+  - hostname: openclaw
+    type: nodejs@22
+    buildFromGit: https://github.com/krls2020/recipe-openclaw
+    enableSubdomainAccess: true
+    minContainers: 1
+    maxContainers: 1
+    verticalAutoscaling:
+      minRam: 2
+      maxRam: 4
+    priority: 5
+    mount:
+      - storage
+    envSecrets:
+      SETUP_PASSWORD: <@generateRandomString(<32>)>
+      OPENCLAW_GATEWAY_TOKEN: <@generateRandomString(<64>)>
